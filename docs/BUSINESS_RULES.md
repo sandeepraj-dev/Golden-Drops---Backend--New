@@ -1,0 +1,12 @@
+# Business rules
+- API monetary inputs are rupees; financial totals persist as integer paise. Quantity is KG, up to 3 decimals by request convention.
+- Purchase total = quantity × purchase rate. Initial advance creates one payment row and is counted once. Outstanding = total − all posted payments.
+- Purchase increases stock through a `PURCHASE` ledger entry. It updates the oil type's default purchase price. If oil selling price is unset/zero, it initializes it as purchase price + settings default profit/KG.
+- Sales use the configured oil type selling price unless a line price override is sent. Sale cost is weighted-average current inventory cost recorded at sale time. Gross profit = sale revenue − recorded cost of goods sold.
+- Sale decreases stock via negative ledger movements. Sale creation writes an oil-type stock-version field inside the MongoDB transaction to create a write conflict for competing sales on the same oil; duplicate oil lines are aggregated for stock validation. Insufficient stock is rejected. Purchase/sale/payment operations use MongoDB sessions and require a replica set.
+- A sale's stock and financial values are immutable after completion. Cancel and recreate to correct. Sale cancellation posts stock reversal. Purchase cancellation is allowed only if sufficient current stock remains to reverse the full purchase.
+- A payment cannot exceed current outstanding. Payment records are separate from transaction records to avoid counting an advance twice.
+- Supplier and manufacturer snapshots preserve bill display when master data changes.
+- Public IDs start at 101 per collection. Bill numbers are generated from year and count; unique indexes are the final duplicate guard. Use Idempotency-Key on transaction POSTs to reduce duplicate submissions.
+- Env variables seed initial settings/admin; existing BusinessSettings in MongoDB take precedence. Changing `ADMIN_PASSWORD` in `.env` does not rotate an existing user's password.
+- Current project limitation: sale stock ledger/cost algorithm and bill numbering should receive concurrency stress tests before live production use. This is not represented as production-certified.

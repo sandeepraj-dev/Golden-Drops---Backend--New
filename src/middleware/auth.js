@@ -1,0 +1,2 @@
+import jwt from 'jsonwebtoken';import {env} from '../config/env.js';import {AppError} from '../utils/errors.js';
+export function requireAuth(req,res,next){try{const header=req.get('authorization')||'';if(!header.startsWith('Bearer '))throw new AppError('Bearer access token required',401,'AUTH_REQUIRED');const payload=jwt.verify(header.slice(7),env.JWT_SECRET);req.user={id:Number(payload.sub),username:payload.username,role:payload.role};next()}catch(e){next(e instanceof AppError?e:new AppError('Invalid or expired access token',401,'INVALID_TOKEN'))}}
