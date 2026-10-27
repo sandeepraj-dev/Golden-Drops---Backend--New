@@ -1,8 +1,421 @@
-import mongoose from 'mongoose';import Manufacturer from '../models/Manufacturer.js';import Supplier from '../models/Supplier.js';import OilType from '../models/OilType.js';import Purchase from '../models/Purchase.js';import Sale from '../models/Sale.js';import Payment from '../models/Payment.js';import StockLedger from '../models/StockLedger.js';import BusinessSettings from '../models/BusinessSettings.js';import {AppError} from '../utils/errors.js';import {stockForOil,ensureStock} from './stockService.js';
-const paise=n=>Math.round((Number(n)+Number.EPSILON)*100);const rupees=n=>Math.round(n)/100;const status=(paid,total)=>paid<=0?'UNPAID':paid>=total?'PAID':'PARTIALLY_PAID';
-async function number(prefix,Model,date,session){const year=new Date(date).getFullYear();const count=await Model.countDocuments({[prefix==='PUR'?'purchaseNumber':'saleNumber'] : new RegExp(`^${prefix}-${year}-`)}).session(session);return `${prefix}-${year}-${String(count+1).padStart(4,'0')}`}
-export async function createPurchase(body,idempotencyKey){if(idempotencyKey){const old=await Purchase.findOne({idempotencyKey});if(old)return old}const session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{const m=await Manufacturer.findOne({id:body.manufacturerId,isActive:true}).session(session);if(!m)throw new AppError('Active manufacturer not found',404);const oil=await OilType.findOne({id:body.oilTypeId,isActive:true}).session(session);if(!oil)throw new AppError('Active oil type not found',404);const date=body.purchaseDate||new Date(),total=paise(body.quantityKg*body.purchasePricePerKg),advance=paise(body.advanceAmount||0);if(advance>total)throw new AppError('Advance cannot exceed purchase total',400);const doc=new Purchase({purchaseNumber:await number('PUR',Purchase,date,session),manufacturerId:m.id,manufacturerSnapshot:{id:m.id,name:m.name,phone:m.phone,address:m.address},oilTypeId:oil.id,oilSnapshot:{id:oil.id,name:oil.name,code:oil.code},quantityKg:body.quantityKg,purchasePricePaisePerKg:paise(body.purchasePricePerKg),totalPaise:total,gpayNumber:body.gpayNumber||'',purchaseDate:date,notes:body.notes||'',totalPaidPaise:advance,outstandingPaise:total-advance,paymentStatus:status(advance,total),idempotencyKey});await doc.save({session});oil.defaultPurchasePricePerKg=body.purchasePricePerKg;const settingsForPrice=await BusinessSettings.findOne({key:'main'}).session(session);if(!(oil.sellingPricePerKg>0))oil.sellingPricePerKg=Number((body.purchasePricePerKg+Number(settingsForPrice?.defaultProfitPerKg??20)).toFixed(2));await oil.save({session});const st=await stockForOil(oil.id,session);const balance=st.quantityKg+body.quantityKg;await StockLedger.create([{oilTypeId:oil.id,movementType:'PURCHASE',quantityKg:body.quantityKg,unitCostPaise:doc.purchasePricePaisePerKg,referenceType:'PURCHASE',referenceId:doc.id,referenceNumber:doc.purchaseNumber,occurredAt:date,balanceAfterKg:balance}],{session});if(advance>0)await Payment.create([{direction:'PURCHASE',transactionId:doc.id,amountPaise:advance,paymentDate:date,method:'GPAY',notes:'Initial advance'}],{session});result=doc});return result}finally{await session.endSession()}}
-export async function addPayment(direction,transactionId,body){const session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{const Model=direction==='PURCHASE'?Purchase:Sale;const doc=await Model.findOne({id:transactionId,status:'COMPLETED'}).session(session);if(!doc)throw new AppError('Transaction not found or cancelled',404);const total=direction==='PURCHASE'?doc.totalPaise:doc.grandTotalPaise;const paid=doc.totalPaidPaise+paise(body.amount);if(paid>total)throw new AppError('Payment exceeds outstanding balance',400);const p=new Payment({direction,transactionId,amountPaise:paise(body.amount),paymentDate:body.paymentDate||new Date(),method:body.method||'GPAY',reference:body.reference||'',notes:body.notes||''});await p.save({session});doc.totalPaidPaise=paid;doc.outstandingPaise=total-paid;doc.paymentStatus=status(paid,total);await doc.save({session});result=p});return result}finally{await session.endSession()}}
-export async function createSale(body,idempotencyKey){if(idempotencyKey){const old=await Sale.findOne({idempotencyKey});if(old)return old}const session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{let supplier;if(body.supplierId)supplier=await Supplier.findOne({id:body.supplierId,isActive:true}).session(session);else{const settings=await BusinessSettings.findOne({key:'main'}).session(session);supplier=settings?.defaultSupplierId?await Supplier.findOne({id:settings.defaultSupplierId,isActive:true}).session(session):await Supplier.findOne({isDefault:true,isActive:true}).session(session)}if(!supplier)throw new AppError('No active supplier supplied or configured as default',400);const settings=await BusinessSettings.findOne({key:'main'}).session(session);const items=[];let total=0,cost=0,qty=0;const requestedByOil=new Map();for(const input of body.items)requestedByOil.set(input.oilTypeId,(requestedByOil.get(input.oilTypeId)||0)+input.quantityKg);for(const [oilId,requestedQty] of requestedByOil){const lock=await OilType.updateOne({id:oilId,isActive:true},{$inc:{stockVersion:1}},{session});if(!lock.matchedCount)throw new AppError(`Active oil type ${oilId} not found`,404);const current=await stockForOil(oilId,session);await ensureStock(oilId,requestedQty,session)}for(const input of body.items){const oil=await OilType.findOne({id:input.oilTypeId,isActive:true}).session(session);if(!oil)throw new AppError(`Active oil type ${input.oilTypeId} not found`,404);const st=await ensureStock(oil.id,input.quantityKg,session);const costPer=st.averageCostPaisePerKg;const configuredPrice=Number(oil.sellingPricePerKg||0);const pricePer=input.sellingPricePerKg==null?(configuredPrice>0?paise(configuredPrice):costPer+paise(settings?.defaultProfitPerKg??20)):paise(input.sellingPricePerKg);const line= Math.round(input.quantityKg*pricePer),lineCost=Math.round(input.quantityKg*costPer);items.push({oilTypeId:oil.id,oilSnapshot:{id:oil.id,name:oil.name,code:oil.code},quantityKg:input.quantityKg,sellingPricePaisePerKg:pricePer,costPaisePerKg:costPer,lineTotalPaise:line,lineCostPaise:lineCost,grossProfitPaise:line-lineCost});total+=line;cost+=lineCost;qty+=input.quantityKg}const date=body.saleDate||new Date();const advance=paise(body.paymentReceived||0);if(advance>total)throw new AppError('Payment received cannot exceed bill total',400);const doc=new Sale({saleNumber:await number('SAL',Sale,date,session),supplierId:supplier.id,supplierSnapshot:{id:supplier.id,name:supplier.name,phone:supplier.phone,address:supplier.address,gpayNumber:supplier.gpayNumber},items,saleDate:date,totalQuantityKg:qty,grandTotalPaise:total,totalCostPaise:cost,grossProfitPaise:total-cost,totalPaidPaise:advance,outstandingPaise:total-advance,paymentStatus:status(advance,total),notes:body.notes||'',idempotencyKey});await doc.save({session});for(const item of items){const st=await stockForOil(item.oilTypeId,session);await StockLedger.create([{oilTypeId:item.oilTypeId,movementType:'SALE',quantityKg:-item.quantityKg,unitCostPaise:item.costPaisePerKg,referenceType:'SALE',referenceId:doc.id,referenceNumber:doc.saleNumber,occurredAt:date,balanceAfterKg:st.quantityKg-item.quantityKg}],{session})}if(advance>0)await Payment.create([{direction:'SALE',transactionId:doc.id,amountPaise:advance,paymentDate:date,method:body.paymentMethod||'GPAY',notes:'Payment received with sale'}],{session});result=doc});return result}finally{await session.endSession()}}
-export async function cancelTransaction(type,id){const session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{if(type==='PURCHASE'){const p=await Purchase.findOne({id}).session(session);if(!p)throw new AppError('Purchase not found',404);if(p.status==='CANCELLED')throw new AppError('Already cancelled',409);const st=await stockForOil(p.oilTypeId,session);if(st.quantityKg+1e-9<p.quantityKg)throw new AppError('Cannot cancel purchase: some purchased stock has already been sold',409);await StockLedger.create([{oilTypeId:p.oilTypeId,movementType:'PURCHASE_REVERSAL',quantityKg:-p.quantityKg,unitCostPaise:p.purchasePricePaisePerKg,referenceType:'PURCHASE',referenceId:p.id,referenceNumber:p.purchaseNumber,occurredAt:new Date(),balanceAfterKg:st.quantityKg-p.quantityKg}],{session});p.status='CANCELLED';await p.save({session});result=p}else{const s=await Sale.findOne({id}).session(session);if(!s)throw new AppError('Sale not found',404);if(s.status==='CANCELLED')throw new AppError('Already cancelled',409);for(const item of s.items){const st=await stockForOil(item.oilTypeId,session);await StockLedger.create([{oilTypeId:item.oilTypeId,movementType:'SALE_REVERSAL',quantityKg:item.quantityKg,unitCostPaise:item.costPaisePerKg,referenceType:'SALE',referenceId:s.id,referenceNumber:s.saleNumber,occurredAt:new Date(),balanceAfterKg:st.quantityKg+item.quantityKg}],{session})}s.status='CANCELLED';await s.save({session});result=s}});return result}finally{await session.endSession()}}
-export const moneyFields=doc=>{const x=doc.toObject?doc.toObject():{...doc};for(const k of ['purchasePricePaisePerKg','totalPaise','totalPaidPaise','outstandingPaise','grandTotalPaise','totalCostPaise','grossProfitPaise'])if(x[k]!==undefined)x[k.replace('Paise','')]=rupees(x[k]);if(x.items)x.items=x.items.map(i=>({...i,sellingPricePerKg:rupees(i.sellingPricePaisePerKg),costPerKg:rupees(i.costPaisePerKg),lineTotal:rupees(i.lineTotalPaise),lineCost:rupees(i.lineCostPaise),grossProfit:rupees(i.grossProfitPaise)}));return x};
+import mongoose from "mongoose";
+import Manufacturer from "../models/Manufacturer.js";
+import Supplier from "../models/Supplier.js";
+import OilType from "../models/OilType.js";
+import Purchase from "../models/Purchase.js";
+import Sale from "../models/Sale.js";
+import Payment from "../models/Payment.js";
+import StockLedger from "../models/StockLedger.js";
+import BusinessSettings from "../models/BusinessSettings.js";
+import { AppError } from "../utils/errors.js";
+import { stockForOil, ensureStock } from "./stockService.js";
+const paise = (n) => Math.round((Number(n) + Number.EPSILON) * 100);
+const rupees = (n) => Math.round(n) / 100;
+const status = (paid, total) =>
+  paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIALLY_PAID";
+async function number(prefix, Model, date, session) {
+  const year = new Date(date).getFullYear();
+  const count = await Model.countDocuments({
+    [prefix === "PUR" ? "purchaseNumber" : "saleNumber"]: new RegExp(
+      `^${prefix}-${year}-`,
+    ),
+  }).session(session);
+  return `${prefix}-${year}-${String(count + 1).padStart(4, "0")}`;
+}
+export async function createPurchase(body, idempotencyKey) {
+  if (idempotencyKey) {
+    const old = await Purchase.findOne({ idempotencyKey });
+    if (old) return old;
+  }
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const m = await Manufacturer.findOne({
+        id: body.manufacturerId,
+        isActive: true,
+      }).session(session);
+      if (!m) throw new AppError("Active manufacturer not found", 404);
+      const oil = await OilType.findOne({
+        id: body.oilTypeId,
+        isActive: true,
+      }).session(session);
+      if (!oil) throw new AppError("Active oil type not found", 404);
+      const date = body.purchaseDate || new Date(),
+        total = paise(body.quantityKg * body.purchasePricePerKg),
+        advance = paise(body.advanceAmount || 0);
+      if (advance > total)
+        throw new AppError("Advance cannot exceed purchase total", 400);
+      const doc = new Purchase({
+        purchaseNumber: await number("PUR", Purchase, date, session),
+        manufacturerId: m.id,
+        manufacturerSnapshot: {
+          id: m.id,
+          name: m.name,
+          phone: m.phone,
+          address: m.address,
+        },
+        oilTypeId: oil.id,
+        oilSnapshot: { id: oil.id, name: oil.name, code: oil.code },
+        quantityKg: body.quantityKg,
+        purchasePricePaisePerKg: paise(body.purchasePricePerKg),
+        totalPaise: total,
+        gpayNumber: body.gpayNumber || "",
+        purchaseDate: date,
+        notes: body.notes || "",
+        totalPaidPaise: advance,
+        outstandingPaise: total - advance,
+        paymentStatus: status(advance, total),
+        idempotencyKey,
+      });
+      await doc.save({ session });
+      oil.defaultPurchasePricePerKg = body.purchasePricePerKg;
+      const settingsForPrice = await BusinessSettings.findOne({
+        key: "main",
+      }).session(session);
+      if (!(oil.sellingPricePerKg > 0))
+        oil.sellingPricePerKg = Number(
+          (
+            body.purchasePricePerKg +
+            Number(settingsForPrice?.defaultProfitPerKg ?? 20)
+          ).toFixed(2),
+        );
+      await oil.save({ session });
+      const st = await stockForOil(oil.id, session);
+      const balance = st.quantityKg + body.quantityKg;
+      await StockLedger.create(
+        [
+          {
+            oilTypeId: oil.id,
+            movementType: "PURCHASE",
+            quantityKg: body.quantityKg,
+            unitCostPaise: doc.purchasePricePaisePerKg,
+            referenceType: "PURCHASE",
+            referenceId: doc.id,
+            referenceNumber: doc.purchaseNumber,
+            occurredAt: date,
+            balanceAfterKg: balance,
+          },
+        ],
+        { session },
+      );
+      if (advance > 0)
+        await Payment.create(
+          [
+            {
+              direction: "PURCHASE",
+              transactionId: doc.id,
+              amountPaise: advance,
+              paymentDate: date,
+              method: "GPAY",
+              notes: "Initial advance",
+            },
+          ],
+          { session },
+        );
+      result = doc;
+    });
+    return result;
+  } catch (error) {
+    if (error.code === 11000) {
+      console.error("Duplicate key error:", {
+        message: error.message,
+        collection: error.collection,
+        keyPattern: error.keyPattern,
+        keyValue: error.keyValue,
+      });
+    }
+
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+}
+export async function addPayment(direction, transactionId, body) {
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const Model = direction === "PURCHASE" ? Purchase : Sale;
+      const doc = await Model.findOne({
+        id: transactionId,
+        status: "COMPLETED",
+      }).session(session);
+      if (!doc) throw new AppError("Transaction not found or cancelled", 404);
+      const total =
+        direction === "PURCHASE" ? doc.totalPaise : doc.grandTotalPaise;
+      const paid = doc.totalPaidPaise + paise(body.amount);
+      if (paid > total)
+        throw new AppError("Payment exceeds outstanding balance", 400);
+      const p = new Payment({
+        direction,
+        transactionId,
+        amountPaise: paise(body.amount),
+        paymentDate: body.paymentDate || new Date(),
+        method: body.method || "GPAY",
+        reference: body.reference || "",
+        notes: body.notes || "",
+      });
+      await p.save({ session });
+      doc.totalPaidPaise = paid;
+      doc.outstandingPaise = total - paid;
+      doc.paymentStatus = status(paid, total);
+      await doc.save({ session });
+      result = p;
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
+export async function createSale(body, idempotencyKey) {
+  if (idempotencyKey) {
+    const old = await Sale.findOne({ idempotencyKey });
+    if (old) return old;
+  }
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      let supplier;
+      if (body.supplierId)
+        supplier = await Supplier.findOne({
+          id: body.supplierId,
+          isActive: true,
+        }).session(session);
+      else {
+        const settings = await BusinessSettings.findOne({
+          key: "main",
+        }).session(session);
+        supplier = settings?.defaultSupplierId
+          ? await Supplier.findOne({
+              id: settings.defaultSupplierId,
+              isActive: true,
+            }).session(session)
+          : await Supplier.findOne({ isDefault: true, isActive: true }).session(
+              session,
+            );
+      }
+      if (!supplier)
+        throw new AppError(
+          "No active supplier supplied or configured as default",
+          400,
+        );
+      const settings = await BusinessSettings.findOne({ key: "main" }).session(
+        session,
+      );
+      const items = [];
+      let total = 0,
+        cost = 0,
+        qty = 0;
+      const requestedByOil = new Map();
+      for (const input of body.items)
+        requestedByOil.set(
+          input.oilTypeId,
+          (requestedByOil.get(input.oilTypeId) || 0) + input.quantityKg,
+        );
+      for (const [oilId, requestedQty] of requestedByOil) {
+        const lock = await OilType.updateOne(
+          { id: oilId, isActive: true },
+          { $inc: { stockVersion: 1 } },
+          { session },
+        );
+        if (!lock.matchedCount)
+          throw new AppError(`Active oil type ${oilId} not found`, 404);
+        const current = await stockForOil(oilId, session);
+        await ensureStock(oilId, requestedQty, session);
+      }
+      for (const input of body.items) {
+        const oil = await OilType.findOne({
+          id: input.oilTypeId,
+          isActive: true,
+        }).session(session);
+        if (!oil)
+          throw new AppError(
+            `Active oil type ${input.oilTypeId} not found`,
+            404,
+          );
+        const st = await ensureStock(oil.id, input.quantityKg, session);
+        const costPer = st.averageCostPaisePerKg;
+        const configuredPrice = Number(oil.sellingPricePerKg || 0);
+        const pricePer =
+          input.sellingPricePerKg == null
+            ? configuredPrice > 0
+              ? paise(configuredPrice)
+              : costPer + paise(settings?.defaultProfitPerKg ?? 20)
+            : paise(input.sellingPricePerKg);
+        const line = Math.round(input.quantityKg * pricePer),
+          lineCost = Math.round(input.quantityKg * costPer);
+        items.push({
+          oilTypeId: oil.id,
+          oilSnapshot: { id: oil.id, name: oil.name, code: oil.code },
+          quantityKg: input.quantityKg,
+          sellingPricePaisePerKg: pricePer,
+          costPaisePerKg: costPer,
+          lineTotalPaise: line,
+          lineCostPaise: lineCost,
+          grossProfitPaise: line - lineCost,
+        });
+        total += line;
+        cost += lineCost;
+        qty += input.quantityKg;
+      }
+      const date = body.saleDate || new Date();
+      const advance = paise(body.paymentReceived || 0);
+      if (advance > total)
+        throw new AppError("Payment received cannot exceed bill total", 400);
+      const doc = new Sale({
+        saleNumber: await number("SAL", Sale, date, session),
+        supplierId: supplier.id,
+        supplierSnapshot: {
+          id: supplier.id,
+          name: supplier.name,
+          phone: supplier.phone,
+          address: supplier.address,
+          gpayNumber: supplier.gpayNumber,
+        },
+        items,
+        saleDate: date,
+        totalQuantityKg: qty,
+        grandTotalPaise: total,
+        totalCostPaise: cost,
+        grossProfitPaise: total - cost,
+        totalPaidPaise: advance,
+        outstandingPaise: total - advance,
+        paymentStatus: status(advance, total),
+        notes: body.notes || "",
+        idempotencyKey,
+      });
+      await doc.save({ session });
+      for (const item of items) {
+        const st = await stockForOil(item.oilTypeId, session);
+        await StockLedger.create(
+          [
+            {
+              oilTypeId: item.oilTypeId,
+              movementType: "SALE",
+              quantityKg: -item.quantityKg,
+              unitCostPaise: item.costPaisePerKg,
+              referenceType: "SALE",
+              referenceId: doc.id,
+              referenceNumber: doc.saleNumber,
+              occurredAt: date,
+              balanceAfterKg: st.quantityKg - item.quantityKg,
+            },
+          ],
+          { session },
+        );
+      }
+      if (advance > 0)
+        await Payment.create(
+          [
+            {
+              direction: "SALE",
+              transactionId: doc.id,
+              amountPaise: advance,
+              paymentDate: date,
+              method: body.paymentMethod || "GPAY",
+              notes: "Payment received with sale",
+            },
+          ],
+          { session },
+        );
+      result = doc;
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
+export async function cancelTransaction(type, id) {
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      if (type === "PURCHASE") {
+        const p = await Purchase.findOne({ id }).session(session);
+        if (!p) throw new AppError("Purchase not found", 404);
+        if (p.status === "CANCELLED")
+          throw new AppError("Already cancelled", 409);
+        const st = await stockForOil(p.oilTypeId, session);
+        if (st.quantityKg + 1e-9 < p.quantityKg)
+          throw new AppError(
+            "Cannot cancel purchase: some purchased stock has already been sold",
+            409,
+          );
+        await StockLedger.create(
+          [
+            {
+              oilTypeId: p.oilTypeId,
+              movementType: "PURCHASE_REVERSAL",
+              quantityKg: -p.quantityKg,
+              unitCostPaise: p.purchasePricePaisePerKg,
+              referenceType: "PURCHASE",
+              referenceId: p.id,
+              referenceNumber: p.purchaseNumber,
+              occurredAt: new Date(),
+              balanceAfterKg: st.quantityKg - p.quantityKg,
+            },
+          ],
+          { session },
+        );
+        p.status = "CANCELLED";
+        await p.save({ session });
+        result = p;
+      } else {
+        const s = await Sale.findOne({ id }).session(session);
+        if (!s) throw new AppError("Sale not found", 404);
+        if (s.status === "CANCELLED")
+          throw new AppError("Already cancelled", 409);
+        for (const item of s.items) {
+          const st = await stockForOil(item.oilTypeId, session);
+          await StockLedger.create(
+            [
+              {
+                oilTypeId: item.oilTypeId,
+                movementType: "SALE_REVERSAL",
+                quantityKg: item.quantityKg,
+                unitCostPaise: item.costPaisePerKg,
+                referenceType: "SALE",
+                referenceId: s.id,
+                referenceNumber: s.saleNumber,
+                occurredAt: new Date(),
+                balanceAfterKg: st.quantityKg + item.quantityKg,
+              },
+            ],
+            { session },
+          );
+        }
+        s.status = "CANCELLED";
+        await s.save({ session });
+        result = s;
+      }
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
+export const moneyFields = (doc) => {
+  const x = doc.toObject ? doc.toObject() : { ...doc };
+  for (const k of [
+    "purchasePricePaisePerKg",
+    "totalPaise",
+    "totalPaidPaise",
+    "outstandingPaise",
+    "grandTotalPaise",
+    "totalCostPaise",
+    "grossProfitPaise",
+  ])
+    if (x[k] !== undefined) x[k.replace("Paise", "")] = rupees(x[k]);
+  if (x.items)
+    x.items = x.items.map((i) => ({
+      ...i,
+      sellingPricePerKg: rupees(i.sellingPricePaisePerKg),
+      costPerKg: rupees(i.costPaisePerKg),
+      lineTotal: rupees(i.lineTotalPaise),
+      lineCost: rupees(i.lineCostPaise),
+      grossProfit: rupees(i.grossProfitPaise),
+    }));
+  return x;
+};
