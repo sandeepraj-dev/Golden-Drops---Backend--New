@@ -12,7 +12,7 @@ import {
   moneyFields,
 } from "../services/transactionService.js";
 import { listStock, stockForOil } from "../services/stockService.js";
-import { makeBill } from "../utils/pdf.js";
+import { makeBill, makeBulkSalesReport } from "../utils/pdf.js";
 const filters = (q) => {
   const f = {};
   if (q.status) f.status = q.status;
@@ -79,6 +79,36 @@ export const listSales = asyncHandler(async (req, res) => {
   data.items = data.items.map(moneyFields);
   ok(res, data);
 });
+// Bulk sales history: only sales containing multiple oil lines.
+export const listBulkSales = asyncHandler(async (req, res) => {
+  const f = { items: { $exists: true, $type: "array", $not: { $size: 0 } } };
+  if (req.query.status) f.status = req.query.status;
+  if (req.query.supplierId) f.supplierId = Number(req.query.supplierId);
+  if (req.query.search) f.saleNumber = { $regex: String(req.query.search), $options: "i" };
+  if (req.query.from || req.query.to) {
+    f.saleDate = {};
+    if (req.query.from) f.saleDate.$gte = new Date(req.query.from);
+    if (req.query.to) f.saleDate.$lte = new Date(req.query.to + "T23:59:59.999Z");
+  }
+  // Exclude single-line sales so this endpoint is specifically for bulk bills.
+  f.$expr = { $gt: [{ $size: "$items" }, 1] };
+  const data = await paginated(Sale, f, req.query, { saleDate: -1, createdAt: -1 });
+  data.items = data.items.map(moneyFields);
+  ok(res, data, "Bulk sales retrieved successfully");
+});
+
+export const bulkSalesPdf = asyncHandler(async (req, res) => {
+  const f = { status: { $ne: "CANCELLED" }, $expr: { $gt: [{ $size: "$items" }, 1] } };
+  if (req.query.supplierId) f.supplierId = Number(req.query.supplierId);
+  if (req.query.from || req.query.to) {
+    f.saleDate = {};
+    if (req.query.from) f.saleDate.$gte = new Date(req.query.from);
+    if (req.query.to) f.saleDate.$lte = new Date(req.query.to + "T23:59:59.999Z");
+  }
+  const sales = await Sale.find(f).sort({ saleDate: -1, createdAt: -1 }).limit(500);
+  return makeBulkSalesReport(res, sales);
+});
+
 export const getSale = asyncHandler(async (req, res) => {
   const s = await Sale.findOne({ id: Number(req.params.id) });
   if (!s) throw new AppError("Sales bill not found", 404);
