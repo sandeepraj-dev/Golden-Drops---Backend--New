@@ -7,6 +7,7 @@ import Sale from "../models/Sale.js";
 import Payment from "../models/Payment.js";
 import StockLedger from "../models/StockLedger.js";
 import BusinessSettings from "../models/BusinessSettings.js";
+import Counter from "../models/Counter.js";
 import { AppError } from "../utils/errors.js";
 import { stockForOil, ensureStock } from "./stockService.js";
 const paise = (n) => Math.round((Number(n) + Number.EPSILON) * 100);
@@ -14,13 +15,37 @@ const rupees = (n) => Math.round(n) / 100;
 const status = (paid, total) =>
   paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIALLY_PAID";
 async function number(prefix, Model, date, session) {
+  // Use a per-year atomic counter rather than countDocuments()+1. The old
+  // implementation could generate the same bill number for concurrent requests.
   const year = new Date(date).getFullYear();
-  const count = await Model.countDocuments({
-    [prefix === "PUR" ? "purchaseNumber" : "saleNumber"]: new RegExp(
-      `^${prefix}-${year}-`,
-    ),
-  }).session(session);
-  return `${prefix}-${year}-${String(count + 1).padStart(4, "0")}`;
+  const field = prefix === "PUR" ? "purchaseNumber" : "saleNumber";
+  const counterKey = `${prefix}-${year}`;
+
+  // Seed a new counter from the highest existing suffix, so deploying this
+  // fix does not collide with bills created before the counter existed.
+  const existingCounter = await Counter.findById(counterKey).session(session);
+  if (!existingCounter) {
+    const existing = await Model.find(
+      { [field]: new RegExp(`^${prefix}-${year}-\\d+$`) },
+      { [field]: 1, _id: 0 },
+    ).session(session).lean();
+    const highest = existing.reduce((max, row) => {
+      const suffix = Number(String(row[field] || "").split("-").at(-1));
+      return Number.isFinite(suffix) ? Math.max(max, suffix) : max;
+    }, 0);
+    await Counter.updateOne(
+      { _id: counterKey },
+      { $setOnInsert: { seq: highest } },
+      { upsert: true, session },
+    );
+  }
+
+  const counter = await Counter.findOneAndUpdate(
+    { _id: counterKey },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, session, setDefaultsOnInsert: true },
+  );
+  return `${prefix}-${year}-${String(counter.seq).padStart(4, "0")}`;
 }
 export async function createPurchase(body, idempotencyKey) {
   if (idempotencyKey) {
@@ -126,6 +151,12 @@ export async function createPurchase(body, idempotencyKey) {
       });
     }
 
+    // A repeated Idempotency-Key represents the same client operation. If a
+    // concurrent request won the race, return its already-created bill.
+    if (error.code === 11000 && idempotencyKey) {
+      const existing = await Purchase.findOne({ idempotencyKey });
+      if (existing) return existing;
+    }
     throw error;
   } finally {
     await session.endSession();
@@ -323,6 +354,13 @@ export async function createSale(body, idempotencyKey) {
       result = doc;
     });
     return result;
+  } catch (error) {
+    // If two retries with the same Idempotency-Key race, return the first bill.
+    if (error.code === 11000 && idempotencyKey) {
+      const existing = await Sale.findOne({ idempotencyKey });
+      if (existing) return existing;
+    }
+    throw error;
   } finally {
     await session.endSession();
   }

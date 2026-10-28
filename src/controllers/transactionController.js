@@ -114,6 +114,18 @@ export const listPayments = (direction) =>
 export const getStock = asyncHandler(async (req, res) =>
   ok(res, await listStock()),
 );
+
+// For the sale-entry screen: return only active oil types with positive stock.
+// Each row includes the numeric oilTypeId the client should submit in items[].
+export const getAvailableStock = asyncHandler(async (req, res) => {
+  const all = await listStock();
+  const items = all.filter((row) => Number(row.availableStockKg) > 0);
+  ok(res, {
+    items,
+    count: items.length,
+    totalAvailableKg: Number(items.reduce((sum, row) => sum + Number(row.availableStockKg || 0), 0).toFixed(3)),
+  });
+});
 export const getStockOil = asyncHandler(async (req, res) => {
   const id = Number(req.params.oilTypeId);
   const s = await stockForOil(id);
