@@ -8,6 +8,7 @@ import Payment from "../models/Payment.js";
 import StockLedger from "../models/StockLedger.js";
 import BusinessSettings from "../models/BusinessSettings.js";
 import Counter from "../models/Counter.js";
+import AuditLog from "../models/AuditLog.js";
 import { AppError } from "../utils/errors.js";
 import { stockForOil, ensureStock } from "./stockService.js";
 const paise = (n) => Math.round((Number(n) + Number.EPSILON) * 100);
@@ -434,6 +435,108 @@ export async function cancelTransaction(type, id) {
     await session.endSession();
   }
 }
+
+/**
+ * Permanently remove a purchase or sale and its dependent financial/stock rows.
+ * Purchase deletion is rejected when removing its stock receipt would make
+ * any later stock movement negative. All writes run in one Mongo transaction.
+ */
+export async function deleteTransaction(type, id, actor = {}) {
+  if (!["PURCHASE", "SALE"].includes(type)) throw new AppError("Unsupported transaction type", 400);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new AppError("Invalid transaction ID", 400);
+
+  const Model = type === "PURCHASE" ? Purchase : Sale;
+  const numberField = type === "PURCHASE" ? "purchaseNumber" : "saleNumber";
+  const session = await mongoose.startSession();
+  let deleted;
+
+  try {
+    await session.withTransaction(async () => {
+      const transaction = await Model.findOne({ id }).session(session);
+      if (!transaction) throw new AppError(type === "PURCHASE" ? "Purchase not found" : "Sale not found", 404);
+
+      const ledgerRows = await StockLedger.find({ referenceType: type, referenceId: id }).session(session).lean();
+      const transactionOilIds = type === "PURCHASE"
+        ? [Number(transaction.oilTypeId)]
+        : (transaction.items || []).map(item => Number(item.oilTypeId));
+      const affectedOilIds = [...new Set([
+        ...ledgerRows.map(row => Number(row.oilTypeId)),
+        ...transactionOilIds,
+      ].filter(oilId => Number.isSafeInteger(oilId) && oilId > 0))];
+
+      // A purchase contributes to stock and to the weighted-average cost used
+      // by later sales. Reject deletion if any later stock-out exists, so old
+      // sales COGS/profit figures cannot silently become inconsistent.
+      if (type === "PURCHASE" && transaction.status !== "CANCELLED") {
+        const oilId = Number(transaction.oilTypeId);
+        const allOilRows = await StockLedger.find({ oilTypeId: oilId })
+          .sort({ occurredAt: 1, _id: 1 }).session(session).lean();
+        const targetIndex = allOilRows.findIndex(row =>
+          row.referenceType === "PURCHASE" && Number(row.referenceId) === id && Number(row.quantityKg) > 0
+        );
+        const rowsAfterPurchase = targetIndex >= 0
+          ? allOilRows.slice(targetIndex + 1)
+          : allOilRows.filter(row => !(row.referenceType === "PURCHASE" && Number(row.referenceId) === id));
+        if (rowsAfterPurchase.some(row => Number(row.quantityKg) < 0)) {
+          throw new AppError(
+            "Cannot delete this purchase because later sales or stock-out movements depend on its inventory/cost. Delete those dependent records first, then retry.",
+            409,
+            "PURCHASE_STOCK_ALREADY_USED",
+          );
+        }
+
+        // Also ensure the remaining chronological ledger cannot go negative.
+        let runningKg = 0;
+        for (const row of allOilRows) {
+          if (row.referenceType === "PURCHASE" && Number(row.referenceId) === id) continue;
+          runningKg = Math.round((runningKg + Number(row.quantityKg || 0)) * 1000) / 1000;
+          if (runningKg < -1e-9) {
+            throw new AppError("Cannot delete this purchase because remaining stock movements would create negative inventory.", 409, "PURCHASE_STOCK_ALREADY_USED");
+          }
+        }
+      }
+
+      const paymentResult = await Payment.deleteMany({ direction: type, transactionId: id }, { session });
+      const ledgerResult = await StockLedger.deleteMany({ referenceType: type, referenceId: id }, { session });
+      const transactionNumber = transaction[numberField];
+      await Model.deleteOne({ _id: transaction._id }, { session });
+
+      // balanceAfterKg is a stored snapshot; recalculate it after removing rows.
+      for (const oilTypeId of affectedOilIds) {
+        const rows = await StockLedger.find({ oilTypeId }).sort({ occurredAt: 1, _id: 1 }).session(session).lean();
+        let balanceKg = 0;
+        const operations = rows.map(row => {
+          balanceKg = Math.round((balanceKg + Number(row.quantityKg || 0)) * 1000) / 1000;
+          return { updateOne: { filter: { _id: row._id }, update: { $set: { balanceAfterKg: balanceKg } } } };
+        });
+        if (operations.length) await StockLedger.bulkWrite(operations, { session });
+      }
+
+      await AuditLog.create([{
+        action: "PERMANENT_DELETE",
+        entityType: type,
+        entityId: id,
+        details: {
+          transactionNumber,
+          deletedBy: actor.username || "unknown",
+          deletedUserId: actor.id || null,
+          deletedPayments: paymentResult.deletedCount || 0,
+          deletedStockMovements: ledgerResult.deletedCount || 0,
+        },
+      }], { session });
+
+      deleted = {
+        id, transactionNumber, type, deleted: true,
+        deletedPayments: paymentResult.deletedCount || 0,
+        deletedStockMovements: ledgerResult.deletedCount || 0,
+      };
+    });
+    return deleted;
+  } finally {
+    await session.endSession();
+  }
+}
+
 export const moneyFields = (doc) => {
   const x = doc.toObject ? doc.toObject() : { ...doc };
   for (const k of [

@@ -9,6 +9,7 @@ import {
   createSale,
   addPayment,
   cancelTransaction,
+  deleteTransaction,
   moneyFields,
 } from "../services/transactionService.js";
 import { listStock, stockForOil } from "../services/stockService.js";
@@ -54,6 +55,9 @@ export const cancelPurchase = asyncHandler(async (req, res) =>
     moneyFields(await cancelTransaction("PURCHASE", Number(req.params.id))),
     "Purchase cancelled",
   ),
+);
+export const deletePurchase = asyncHandler(async (req, res) =>
+  ok(res, await deleteTransaction("PURCHASE", Number(req.params.id), req.user), "Purchase permanently deleted"),
 );
 export const createSaleCtrl = asyncHandler(async (req, res) =>
   ok(
@@ -120,6 +124,9 @@ export const cancelSale = asyncHandler(async (req, res) =>
     moneyFields(await cancelTransaction("SALE", Number(req.params.id))),
     "Sales bill cancelled",
   ),
+);
+export const deleteSale = asyncHandler(async (req, res) =>
+  ok(res, await deleteTransaction("SALE", Number(req.params.id), req.user), "Sale permanently deleted"),
 );
 export const addPaymentCtrl = (direction) =>
   asyncHandler(async (req, res) =>
