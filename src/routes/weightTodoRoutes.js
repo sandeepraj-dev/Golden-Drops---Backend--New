@@ -14,6 +14,7 @@ router.post('/weight-reports', validate(z.object({ body: weightReportSchema })),
 router.get('/weight-reports', w.listWeightReports);
 router.get('/weight-reports/:id', validate(idParam), w.getWeightReport);
 router.put('/weight-reports/:id', validate(z.object({ params: idParam.shape.params, body: weightReportSchema })), w.updateWeightReport);
+router.post('/weight-reports/bulk-delete', w.bulkDeleteWeightReports);
 router.delete('/weight-reports/:id', validate(idParam), w.deleteWeightReport);
 
 router.post('/todos', validate(z.object({ body: todoSchema })), t.createTodo);
@@ -21,6 +22,7 @@ router.get('/todos', t.listTodos);
 router.get('/todos/:id', validate(idParam), t.getTodo);
 router.put('/todos/:id', validate(z.object({ params: idParam.shape.params, body: todoSchema.partial() })), t.updateTodo);
 router.patch('/todos/:id/status', validate(z.object({ params: idParam.shape.params, body: statusBody.shape.body })), t.setTodoStatus);
+router.post('/todos/bulk-delete', t.bulkDeleteTodos);
 router.delete('/todos/:id', validate(idParam), t.deleteTodo);
 
 export default router;

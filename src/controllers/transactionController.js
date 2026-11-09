@@ -49,15 +49,13 @@ export const getPurchase = asyncHandler(async (req, res) => {
   if (!p) throw new AppError("Purchase not found", 404);
   ok(res, moneyFields(p));
 });
+export const deletePurchase = asyncHandler(async (req,res)=>ok(res,await deleteTransaction("PURCHASE",Number(req.params.id),req.user),"Purchase permanently deleted"));
 export const cancelPurchase = asyncHandler(async (req, res) =>
   ok(
     res,
     moneyFields(await cancelTransaction("PURCHASE", Number(req.params.id))),
     "Purchase cancelled",
   ),
-);
-export const deletePurchase = asyncHandler(async (req, res) =>
-  ok(res, await deleteTransaction("PURCHASE", Number(req.params.id), req.user), "Purchase permanently deleted"),
 );
 export const createSaleCtrl = asyncHandler(async (req, res) =>
   ok(
@@ -118,15 +116,13 @@ export const getSale = asyncHandler(async (req, res) => {
   if (!s) throw new AppError("Sales bill not found", 404);
   ok(res, moneyFields(s));
 });
+export const deleteSale = asyncHandler(async (req,res)=>ok(res,await deleteTransaction("SALE",Number(req.params.id),req.user),"Sale permanently deleted"));
 export const cancelSale = asyncHandler(async (req, res) =>
   ok(
     res,
     moneyFields(await cancelTransaction("SALE", Number(req.params.id))),
     "Sales bill cancelled",
   ),
-);
-export const deleteSale = asyncHandler(async (req, res) =>
-  ok(res, await deleteTransaction("SALE", Number(req.params.id), req.user), "Sale permanently deleted"),
 );
 export const addPaymentCtrl = (direction) =>
   asyncHandler(async (req, res) =>
@@ -192,3 +188,10 @@ export const bill = (type) =>
     if (req.path.endsWith("/pdf")) return makeBill(res, doc, type);
     ok(res, moneyFields(doc));
   });
+
+export const bulkDeleteTransactions = asyncHandler(async (req,res)=>{
+ const type=String(req.params.type||"").toUpperCase(); if(!["PURCHASE","SALE"].includes(type)) throw new AppError("Unsupported transaction type",400);
+ const ids=[...new Set((req.body?.ids||[]).map(Number))]; if(!ids.length||ids.length>100||ids.some(id=>!Number.isSafeInteger(id)||id<=0)) throw new AppError("Provide between 1 and 100 valid record IDs",400,"INVALID_BULK_IDS");
+ const deleted=[],failed=[]; for(const id of ids){try{deleted.push(await deleteTransaction(type,id,req.user));}catch(error){failed.push({id,code:error.code||"DELETE_FAILED",message:error.message||"Delete failed"});}}
+ ok(res,{requested:ids.length,deletedCount:deleted.length,failedCount:failed.length,deleted,failed},failed.length?"Some selected transactions could not be deleted":"Selected transactions permanently deleted");
+});

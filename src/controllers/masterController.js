@@ -1,44 +1,18 @@
-import {asyncHandler,ok,AppError} from '../utils/errors.js';import {paginated} from '../utils/pagination.js';import Manufacturer from '../models/Manufacturer.js';import Supplier from '../models/Supplier.js';import OilType from '../models/OilType.js';import Purchase from '../models/Purchase.js';import Sale from '../models/Sale.js';import BusinessSettings from '../models/BusinessSettings.js';
-const models={manufacturers:Manufacturer,suppliers:Supplier,'oil-types':OilType};const keys={manufacturers:'manufacturer',suppliers:'supplier','oil-types':'oilType'};
-export const listMaster=asyncHandler(async(req,res)=>{
-  const resource=req.params.resource;
-  const Model=models[resource];
-  const filter={};
-  const active=String(req.query.active??'').toLowerCase();
-  if(['true','t','1','yes'].includes(active))filter.isActive=true;
-  if(['false','f','0','no'].includes(active))filter.isActive=false;
-  if(req.query.search){
-    const search=String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.$or=[
-      {name:{$regex:search,$options:'i'}},
-      {code:{$regex:search,$options:'i'}},
-      {phone:{$regex:search,$options:'i'}}
-    ];
-  }
-  // Only Oil Types use the user-defined sequence. Other master lists retain
-  // their existing newest-first ordering.
-  const sort=resource==='oil-types'
-    ? {sequence:1,createdAt:1,id:1,_id:1}
-    : {createdAt:-1};
-  ok(res,await paginated(Model,filter,req.query,sort));
-});
-export const getMaster=asyncHandler(async(req,res)=>{const doc=await models[req.params.resource].findOne({id:Number(req.params.id)});if(!doc)throw new AppError('Record not found',404);ok(res,doc)});
-export const createMaster=asyncHandler(async(req,res)=>{
-  const resource=req.params.resource;
-  const Model=models[resource];
-  const data={...req.body};
-  if(resource==='oil-types' && data.sequence===undefined){
-    const latest=await OilType.findOne({}).sort({sequence:-1,id:-1}).select('sequence').lean();
-    data.sequence=Number(latest?.sequence??0)+1;
-  }
-  if(resource==='suppliers'&&data.isDefault){
-    await Supplier.updateMany({isDefault:true},{isDefault:false});
-  }
-  const doc=await Model.create(data);
-  if(resource==='suppliers'&&doc.isDefault){
-    await BusinessSettings.findOneAndUpdate({key:'main'},{defaultSupplierId:doc.id},{upsert:true,new:true});
-  }
-  ok(res,doc,'Created successfully',201);
-});
-export const updateMaster=asyncHandler(async(req,res)=>{const Model=models[req.params.resource];const doc=await Model.findOne({id:Number(req.params.id)});if(!doc)throw new AppError('Record not found',404);if(req.params.resource==='suppliers'&&req.body.isDefault===true)await Supplier.updateMany({isDefault:true,_id:{$ne:doc._id}},{isDefault:false});Object.assign(doc,req.body);await doc.save();if(req.params.resource==='suppliers'&&doc.isDefault)await BusinessSettings.findOneAndUpdate({key:'main'},{defaultSupplierId:doc.id},{upsert:true});ok(res,doc,'Updated successfully')});
-export const deactivateMaster=asyncHandler(async(req,res)=>{const Model=models[req.params.resource],id=Number(req.params.id);const doc=await Model.findOne({id});if(!doc)throw new AppError('Record not found',404);if(req.params.resource==='manufacturers'&&await Purchase.exists({manufacturerId:id,status:'COMPLETED'})){}if(req.params.resource==='oil-types'&&(await Purchase.exists({oilTypeId:id,status:'COMPLETED'})||await Sale.exists({'items.oilTypeId':id,status:'COMPLETED'}))){}if(req.params.resource==='suppliers'&&doc.isDefault){const sales=await Sale.exists({supplierId:id,status:'COMPLETED'});if(sales)throw new AppError('Default supplier has sales history; configure another default supplier first',409);await BusinessSettings.findOneAndUpdate({key:'main'},{defaultSupplierId:null})}doc.isActive=false;if(doc.isDefault)doc.isDefault=false;await doc.save();ok(res,doc,'Deactivated successfully')});
+import mongoose from "mongoose";
+import {asyncHandler,ok,AppError} from "../utils/errors.js";
+import {paginated} from "../utils/pagination.js";
+import Manufacturer from "../models/Manufacturer.js"; import Supplier from "../models/Supplier.js"; import OilType from "../models/OilType.js";
+import Purchase from "../models/Purchase.js"; import Sale from "../models/Sale.js"; import StockLedger from "../models/StockLedger.js"; import WeightReport from "../models/WeightReport.js"; import Todo from "../models/Todo.js"; import BusinessSettings from "../models/BusinessSettings.js"; import AuditLog from "../models/AuditLog.js";
+const models={manufacturers:Manufacturer,suppliers:Supplier,"oil-types":OilType};
+const parseIds=v=>{const ids=[...new Set((Array.isArray(v)?v:[v]).map(Number))];if(!ids.length||ids.length>100||ids.some(x=>!Number.isSafeInteger(x)||x<=0))throw new AppError("Provide between 1 and 100 valid record IDs",400,"INVALID_BULK_IDS");return ids;};
+async function assertCanDelete(resource,doc,session){
+ if(resource==="manufacturers"&&await Purchase.exists({manufacturerId:doc.id}).session(session))throw new AppError(`Cannot delete ${doc.name}: purchase history refers to this manufacturer.`,409,"MASTER_IN_USE");
+ if(resource==="suppliers"){if(await Sale.exists({supplierId:doc.id}).session(session))throw new AppError(`Cannot delete ${doc.name}: sales history refers to this supplier.`,409,"MASTER_IN_USE");if(doc.isDefault)await BusinessSettings.updateOne({key:"main",defaultSupplierId:doc.id},{$set:{defaultSupplierId:null}},{session});}
+ if(resource==="oil-types"){const [p,s,l,w,t]=await Promise.all([Purchase.exists({oilTypeId:doc.id}).session(session),Sale.exists({"items.oilTypeId":doc.id}).session(session),StockLedger.exists({oilTypeId:doc.id}).session(session),WeightReport.exists({"items.oilTypeId":doc.id}).session(session),Todo.exists({oilTypeId:doc.id}).session(session)]);if(p||s||l||w||t)throw new AppError(`Cannot delete ${doc.name}: this oil type is referenced by purchase, sale, stock, weight-report or todo records.`,409,"MASTER_IN_USE");}
+}
+export const listMaster=asyncHandler(async(req,res)=>{const M=models[req.params.resource],f={};if(req.query.active==="true")f.isActive=true;if(req.query.active==="false")f.isActive=false;if(req.query.search)f.$or=[{name:{$regex:String(req.query.search),$options:"i"}},{code:{$regex:String(req.query.search),$options:"i"}},{phone:{$regex:String(req.query.search),$options:"i"}}];ok(res,await paginated(M,f,req.query));});
+export const getMaster=asyncHandler(async(req,res)=>{const d=await models[req.params.resource].findOne({id:Number(req.params.id)});if(!d)throw new AppError("Record not found",404);ok(res,d);});
+export const createMaster=asyncHandler(async(req,res)=>{const M=models[req.params.resource],data={...req.body};if(req.params.resource==="suppliers"&&data.isDefault)await Supplier.updateMany({isDefault:true},{isDefault:false});const d=await M.create(data);if(req.params.resource==="suppliers"&&d.isDefault)await BusinessSettings.findOneAndUpdate({key:"main"},{defaultSupplierId:d.id},{upsert:true,new:true});ok(res,d,"Created successfully",201);});
+export const updateMaster=asyncHandler(async(req,res)=>{const M=models[req.params.resource],d=await M.findOne({id:Number(req.params.id)});if(!d)throw new AppError("Record not found",404);if(req.params.resource==="suppliers"&&req.body.isDefault===true)await Supplier.updateMany({isDefault:true,_id:{$ne:d._id}},{isDefault:false});Object.assign(d,req.body);await d.save();if(req.params.resource==="suppliers"&&d.isDefault)await BusinessSettings.findOneAndUpdate({key:"main"},{defaultSupplierId:d.id},{upsert:true});ok(res,d,"Updated successfully");});
+export const deactivateMaster=asyncHandler(async(req,res)=>{const resource=req.params.resource,M=models[resource],id=Number(req.params.id),session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{const d=await M.findOne({id}).session(session);if(!d)throw new AppError("Record not found",404);await assertCanDelete(resource,d,session);await M.deleteOne({_id:d._id},{session});await AuditLog.create([{action:"PERMANENT_DELETE",entityType:resource.toUpperCase(),entityId:id,details:{name:d.name}}],{session});result={id,name:d.name,deleted:true};});}finally{await session.endSession();}ok(res,result,"Record permanently deleted");});
+export const bulkDeleteMaster=asyncHandler(async(req,res)=>{const resource=req.params.resource,M=models[resource];if(!M)throw new AppError("Unsupported master resource",404);const ids=parseIds(req.body?.ids),session=await mongoose.startSession();let result;try{await session.withTransaction(async()=>{const docs=await M.find({id:{$in:ids}}).session(session);if(docs.length!==ids.length)throw new AppError("One or more selected records no longer exist. Refresh and try again.",404,"RECORDS_NOT_FOUND");for(const d of docs)await assertCanDelete(resource,d,session);await M.deleteMany({id:{$in:ids}},{session});await AuditLog.insertMany(docs.map(d=>({action:"PERMANENT_DELETE",entityType:resource.toUpperCase(),entityId:d.id,details:{name:d.name,bulk:true}})),{session});result={requested:ids.length,deletedCount:ids.length,deletedIds:ids};});}finally{await session.endSession();}ok(res,result,"Selected records permanently deleted");});

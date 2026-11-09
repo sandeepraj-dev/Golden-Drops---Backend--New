@@ -170,3 +170,5 @@ export const weightReportDashboard = asyncHandler(async (req, res) => {
     recentTransactions: recent,
   });
 });
+
+export const bulkDeleteWeightReports=asyncHandler(async(req,res)=>{const ids=[...new Set((req.body?.ids||[]).map(Number))];if(!ids.length||ids.length>100||ids.some(x=>!Number.isSafeInteger(x)||x<=0))throw new AppError("Provide between 1 and 100 valid record IDs",400,"INVALID_BULK_IDS");const docs=await WeightReport.find({id:{$in:ids}}).select("id").lean();if(docs.length!==ids.length)throw new AppError("One or more selected reports no longer exist. Refresh and try again.",404,"RECORDS_NOT_FOUND");await WeightReport.deleteMany({id:{$in:ids}});ok(res,{requested:ids.length,deletedCount:ids.length,deletedIds:ids},"Selected weight reports deleted successfully");});

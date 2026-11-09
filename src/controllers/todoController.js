@@ -93,3 +93,5 @@ export const deleteTodo = asyncHandler(async (req, res) => {
   if (!doc) throw new AppError('Todo not found', 404, 'TODO_NOT_FOUND');
   ok(res, { id: doc.id }, 'Todo deleted successfully');
 });
+
+export const bulkDeleteTodos=asyncHandler(async(req,res)=>{const ids=[...new Set((req.body?.ids||[]).map(Number))];if(!ids.length||ids.length>100||ids.some(x=>!Number.isSafeInteger(x)||x<=0))throw new AppError("Provide between 1 and 100 valid record IDs",400,"INVALID_BULK_IDS");const docs=await Todo.find({id:{$in:ids}}).select("id").lean();if(docs.length!==ids.length)throw new AppError("One or more selected notes no longer exist. Refresh and try again.",404,"RECORDS_NOT_FOUND");await Todo.deleteMany({id:{$in:ids}});ok(res,{requested:ids.length,deletedCount:ids.length,deletedIds:ids},"Selected notes deleted successfully");});
