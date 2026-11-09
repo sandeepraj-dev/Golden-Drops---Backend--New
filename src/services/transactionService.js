@@ -537,6 +537,167 @@ export async function deleteTransaction(type, id, actor = {}) {
   }
 }
 
+
+/**
+ * Bulk transaction deletion with stock-dependency cascading.
+ * When selected purchases are removed, sales are cascaded only when their
+ * stock-out movement is required to keep the remaining chronological stock
+ * ledger non-negative. A sale is deleted as a whole across all its oil lines.
+ */
+export async function bulkDeleteTransactionsCascade(type, ids, actor = {}) {
+  if (!["PURCHASE", "SALE"].includes(type)) throw new AppError("Unsupported transaction type", 400);
+  const cleanIds = [...new Set(ids)];
+  if (!cleanIds.length || cleanIds.length > 100 || cleanIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new AppError("Provide between 1 and 100 valid record IDs", 400, "INVALID_BULK_IDS");
+  }
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const PurchaseDocs = type === "PURCHASE" ? await Purchase.find({ id: { $in: cleanIds } }).session(session) : [];
+      const SaleDocs = type === "SALE" ? await Sale.find({ id: { $in: cleanIds } }).session(session) : [];
+      const foundIds = (type === "PURCHASE" ? PurchaseDocs : SaleDocs).map(x => Number(x.id));
+      const missing = cleanIds.filter(id => !foundIds.includes(id));
+      if (missing.length) throw new AppError(`Records not found: ${missing.join(", ")}`, 404, "TRANSACTION_NOT_FOUND");
+
+      const deletePurchaseIds = new Set(type === "PURCHASE" ? cleanIds : []);
+      const deleteSaleIds = new Set(type === "SALE" ? cleanIds : []);
+      const oilIds = new Set();
+      for (const p of PurchaseDocs) oilIds.add(Number(p.oilTypeId));
+      for (const sale of SaleDocs) for (const item of sale.items || []) oilIds.add(Number(item.oilTypeId));
+
+      // Iteratively cascade only the sale bills whose stock-out is necessary
+      // to prevent a negative balance after the selected purchase receipts go.
+      if (type === "PURCHASE") {
+        let changed = true;
+        let passes = 0;
+        while (changed && passes++ < 100) {
+          changed = false;
+          for (const oilId of oilIds) {
+            const rows = await StockLedger.find({ oilTypeId: oilId }).sort({ occurredAt: 1, _id: 1 }).session(session).lean();
+            let balance = 0;
+            for (const row of rows) {
+              const refId = Number(row.referenceId);
+              if (row.referenceType === "PURCHASE" && deletePurchaseIds.has(refId)) continue;
+              if (row.referenceType === "SALE" && deleteSaleIds.has(refId)) continue;
+              balance = Math.round((balance + Number(row.quantityKg || 0)) * 1000) / 1000;
+              if (balance < -1e-9) {
+                if (row.referenceType === "SALE") {
+                  if (!deleteSaleIds.has(refId)) {
+                    deleteSaleIds.add(refId);
+                    changed = true;
+                    break;
+                  }
+                } else {
+                  throw new AppError(`Cannot safely delete selected purchases: stock for oil type ${oilId} would become negative after remaining ${row.movementType} movement.`, 409, "STOCK_DEPENDENCY_NOT_SALE");
+                }
+              }
+            }
+          }
+        }
+        if (passes >= 100 && changed) throw new AppError("Could not resolve stock dependencies safely. No records were deleted.", 409, "STOCK_DEPENDENCY_LIMIT");
+      }
+
+      const affectedOilIds = [...oilIds];
+      const deletedPurchaseDocs = PurchaseDocs;
+      const deletedSaleDocs = deleteSaleIds.size
+        ? await Sale.find({ id: { $in: [...deleteSaleIds] } }).session(session)
+        : [];
+      if (type === "PURCHASE" && deletedSaleDocs.length !== deleteSaleIds.size) {
+        throw new AppError("A dependent sale record could not be found. No records were deleted.", 409, "DEPENDENT_SALE_MISSING");
+      }
+      // A cascaded multi-oil bill can affect stock balances for oils beyond
+      // the selected purchase oil. Include every line before recalculation.
+      for (const sale of deletedSaleDocs) for (const item of sale.items || []) oilIds.add(Number(item.oilTypeId));
+
+      const deletedItems = [];
+      const removeDocs = async (Model, docs, direction, refType, numberField) => {
+        for (const doc of docs) {
+          const paymentResult = await Payment.deleteMany({ direction, transactionId: doc.id }, { session });
+          const ledgerResult = await StockLedger.deleteMany({ referenceType: refType, referenceId: doc.id }, { session });
+          await Model.deleteOne({ _id: doc._id }, { session });
+          const transactionNumber = doc[numberField];
+          await AuditLog.create([{
+            action: "PERMANENT_DELETE_CASCADE", entityType: refType, entityId: doc.id,
+            details: { transactionNumber, deletedBy: actor.username || "unknown", deletedUserId: actor.id || null,
+              deletedPayments: paymentResult.deletedCount || 0, deletedStockMovements: ledgerResult.deletedCount || 0,
+              cascade: !cleanIds.includes(Number(doc.id)) },
+          }], { session });
+          deletedItems.push({ id: Number(doc.id), transactionNumber, type: refType, deletedPayments: paymentResult.deletedCount || 0, deletedStockMovements: ledgerResult.deletedCount || 0, cascaded: !cleanIds.includes(Number(doc.id)) });
+        }
+      };
+      await removeDocs(Purchase, deletedPurchaseDocs, "PURCHASE", "PURCHASE", "purchaseNumber");
+      await removeDocs(Sale, deletedSaleDocs, "SALE", "SALE", "saleNumber");
+
+      // Rebuild both stock snapshots and weighted-average COGS for surviving
+      // sale lines. This keeps inventory valuation and profit reports aligned
+      // with the ledger after purchase/sale cascade deletion.
+      const survivingSales = new Map();
+      const usedSaleItems = new Map();
+      for (const oilTypeId of affectedOilIds) {
+        const rows = await StockLedger.find({ oilTypeId }).sort({ occurredAt: 1, _id: 1 }).session(session).lean();
+        let balanceKg = 0;
+        let inventoryCostPaise = 0;
+        const operations = [];
+        for (const row of rows) {
+          const quantity = Number(row.quantityKg || 0);
+          const oldUnitCost = Number(row.unitCostPaise || 0);
+          if (quantity >= 0) {
+            balanceKg += quantity;
+            inventoryCostPaise += Math.round(quantity * oldUnitCost);
+          } else {
+            const removeQuantity = Math.min(balanceKg, Math.abs(quantity));
+            const averageCost = balanceKg > 0 ? Math.round(inventoryCostPaise / balanceKg) : 0;
+            if (row.referenceType === "SALE") {
+              operations.push({ updateOne: { filter: { _id: row._id }, update: { $set: { unitCostPaise: averageCost } } } });
+              let saleDoc = survivingSales.get(Number(row.referenceId));
+              if (!saleDoc) {
+                saleDoc = await Sale.findOne({ id: Number(row.referenceId) }).session(session);
+                if (saleDoc) survivingSales.set(Number(row.referenceId), saleDoc);
+              }
+              if (saleDoc) {
+                const useKey = `${saleDoc.id}:${oilTypeId}`;
+                const used = usedSaleItems.get(useKey) || new Set();
+                const itemIndex = saleDoc.items.findIndex((item, index) => !used.has(index) && Number(item.oilTypeId) === Number(oilTypeId) && Math.abs(Number(item.quantityKg) - Math.abs(quantity)) < 0.001);
+                if (itemIndex >= 0) {
+                  used.add(itemIndex);
+                  usedSaleItems.set(useKey, used);
+                  const item = saleDoc.items[itemIndex];
+                  item.costPaisePerKg = averageCost;
+                  item.lineCostPaise = Math.round(Number(item.quantityKg) * averageCost);
+                  item.grossProfitPaise = Number(item.lineTotalPaise || 0) - item.lineCostPaise;
+                }
+              }
+            }
+            balanceKg += quantity;
+            inventoryCostPaise = Math.max(0, Math.round(inventoryCostPaise - removeQuantity * averageCost));
+          }
+          balanceKg = Math.round(balanceKg * 1000) / 1000;
+          operations.push({ updateOne: { filter: { _id: row._id }, update: { $set: { balanceAfterKg: balanceKg } } } });
+        }
+        if (operations.length) await StockLedger.bulkWrite(operations, { session });
+      }
+      for (const saleDoc of survivingSales.values()) {
+        saleDoc.totalCostPaise = saleDoc.items.reduce((sum, item) => sum + Number(item.lineCostPaise || 0), 0);
+        saleDoc.grossProfitPaise = Number(saleDoc.grandTotalPaise || 0) - saleDoc.totalCostPaise;
+        await saleDoc.save({ session });
+      }
+      result = {
+        requested: cleanIds.length,
+        deletedCount: deletedItems.filter(x => !x.cascaded).length,
+        cascadedSalesCount: deletedItems.filter(x => x.cascaded).length,
+        totalDeletedCount: deletedItems.length,
+        failedCount: 0,
+        deleted: deletedItems,
+        failed: [],
+      };
+    });
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
+
 export const moneyFields = (doc) => {
   const x = doc.toObject ? doc.toObject() : { ...doc };
   for (const k of [

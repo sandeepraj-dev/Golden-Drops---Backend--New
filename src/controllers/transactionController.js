@@ -10,6 +10,7 @@ import {
   addPayment,
   cancelTransaction,
   deleteTransaction,
+  bulkDeleteTransactionsCascade,
   moneyFields,
 } from "../services/transactionService.js";
 import { listStock, stockForOil } from "../services/stockService.js";
@@ -49,7 +50,7 @@ export const getPurchase = asyncHandler(async (req, res) => {
   if (!p) throw new AppError("Purchase not found", 404);
   ok(res, moneyFields(p));
 });
-export const deletePurchase = asyncHandler(async (req,res)=>ok(res,await deleteTransaction("PURCHASE",Number(req.params.id),req.user),"Purchase permanently deleted"));
+export const deletePurchase = asyncHandler(async (req, res) => ok(res, await bulkDeleteTransactionsCascade("PURCHASE", [Number(req.params.id)], req.user), "Purchase and required dependent sales permanently deleted"));
 export const cancelPurchase = asyncHandler(async (req, res) =>
   ok(
     res,
@@ -189,9 +190,12 @@ export const bill = (type) =>
     ok(res, moneyFields(doc));
   });
 
-export const bulkDeleteTransactions = asyncHandler(async (req,res)=>{
- const type=String(req.params.type||"").toUpperCase(); if(!["PURCHASE","SALE"].includes(type)) throw new AppError("Unsupported transaction type",400);
- const ids=[...new Set((req.body?.ids||[]).map(Number))]; if(!ids.length||ids.length>100||ids.some(id=>!Number.isSafeInteger(id)||id<=0)) throw new AppError("Provide between 1 and 100 valid record IDs",400,"INVALID_BULK_IDS");
- const deleted=[],failed=[]; for(const id of ids){try{deleted.push(await deleteTransaction(type,id,req.user));}catch(error){failed.push({id,code:error.code||"DELETE_FAILED",message:error.message||"Delete failed"});}}
- ok(res,{requested:ids.length,deletedCount:deleted.length,failedCount:failed.length,deleted,failed},failed.length?"Some selected transactions could not be deleted":"Selected transactions permanently deleted");
+export const bulkDeleteTransactions = asyncHandler(async (req, res) => {
+  const type = String(req.params.type || "").toUpperCase();
+  if (!["PURCHASE", "SALE"].includes(type)) throw new AppError("Unsupported transaction type", 400);
+  const ids = [...new Set((req.body?.ids || []).map(Number))];
+  const result = await bulkDeleteTransactionsCascade(type, ids, req.user);
+  ok(res, result, result.cascadedSalesCount
+    ? `Selected records deleted with ${result.cascadedSalesCount} dependent sale(s) and linked stock/payment records`
+    : "Selected transactions permanently deleted");
 });
